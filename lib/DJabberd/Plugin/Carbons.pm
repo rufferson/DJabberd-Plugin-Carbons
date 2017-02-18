@@ -189,8 +189,13 @@ sub handle {
     # Check eligibility
     return unless((!$type or $type eq 'chat' or $type eq 'normal' or $type eq 'error')
 	and grep {$_->element_name eq 'body' && $_->children} $msg->children_elements);
-    # Honour private exclusions
-    return if(grep {$_->element eq '{'.CBNSv2.'}private'} $msg->children_elements);
+    # Honour message hints
+    return if(grep{$_->element eq '{urn:xmpp:hints}no-copy'} $msg->children_elements);
+    # Honour private exclusions and remove it
+    if(my @priv=grep {$_->element eq '{'.CBNSv2.'}private'} $msg->children_elements) {
+	$msg->remove_child($priv[0]);
+	return;
+    }
     my $from = $msg->from_jid;
     my $to = $msg->to_jid;
     my @from = $self->enabled($from);
