@@ -42,13 +42,17 @@ sub run_before {
     return qw(DJabberd::Delivery::Local);
 }
 
+my %callmap = (
+    'set-{'.CBNSv2.'}enable' => \&manage,
+    'set-{'.CBNSv2.'}disable' => \&manage,
+);
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
 	my ($vh, $cb, $iq) = @_;
-	if($iq->first_element->namespace eq CBNSv2) {
-	    $self->manage($iq);
-	    $cb->stop_chain;
+	if(exists $callmap{$iq->signature}) {
+	    $callmap{$iq->signature}->($self,$iq);
+	    return $cb->stop_chain;
 	}
 	$cb->decline;
     };
