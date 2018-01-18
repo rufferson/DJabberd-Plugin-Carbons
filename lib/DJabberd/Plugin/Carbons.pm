@@ -206,10 +206,22 @@ sub handle {
     my @to = $self->enabled($to);
     $logger->debug("CCing to ".join(', ',(@from,@to))) if(@from or @to);
     foreach my$jid(@from) {
+	my $conn = $self->vh->find_jid($jid);
+	unless($conn) {
+	    $self->disable(DJabberd::JID->new($jid));
+	    next;
+	}
+	next unless($conn->is_available);
 	my $cc = wrap($msg,$from->as_bare_string,$jid,'sent');
 	$cc->deliver($self->vh);
     }
     foreach my$jid(@to) {
+	my $conn = $self->vh->find_jid($jid);
+	unless($conn) {
+	    $self->disable(DJabberd::JID->new($jid));
+	    next;
+	}
+	next unless($conn->is_available);
 	my $cc = wrap($msg,$to->as_bare_string,$jid,'received');
 	$cc->deliver($self->vh);
     }
