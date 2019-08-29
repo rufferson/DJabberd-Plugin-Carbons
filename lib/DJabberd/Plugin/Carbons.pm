@@ -58,7 +58,32 @@ sub register {
     };
     my $handle_cb = sub {
 	my ($vh,$cb,$sz) = @_;
-	$self->handle($sz) if($sz->isa('DJabberd::Message') && $sz->from && $sz->to);
+	if($sz->isa('DJabberd::Message') && $sz->from && $sz->to) {
+	    # Local is selfish and always stops delivery chain. To execute self
+	    # AFTER local we need to cheat it. But first check if we should
+	    my $type = $sz->attr('{}type');
+	    # Skip anything but chat, normal or error (well...)
+	    return $cb->decline
+		unless(!$type
+			or $type eq 'chat'
+			or $type eq 'normal'
+			or $type eq 'error');
+	    # Skip bodyless control messages
+	    return $cb->decline
+		unless(grep {
+			$_->element_name eq 'body' && $_->children
+		       } $sz->children_elements);
+	    # Honour message hints
+	    return $cb->decline
+		if(grep{$_->element eq '{urn:xmpp:hints}no-copy'}
+		    $sz->children_elements);
+	    # Proceed with the cheat otherwise
+	    my $delivered = $cb->{delivered};
+	    $cb->{delivered} = sub {
+		$self->handle($sz);
+		$delivered->($cb);
+	    }
+	}
 	$cb->decline;
     };
     my $cleanup_cb = sub {
@@ -185,16 +210,12 @@ The method handles message delivery to CC it to enabled resources.
 
 If message is eligible and not private - it is wrapped and delivered to all
 matching C<from> and C<to> local users which enabled the carbons.
+Eligibility is checked at callback handler in the register method.
 =cut
 
 sub handle {
     my ($self,$msg) = @_;
     my $type = $msg->attr('{}type');
-    # Check eligibility
-    return unless((!$type or $type eq 'chat' or $type eq 'normal' or $type eq 'error')
-	and grep {$_->element_name eq 'body' && $_->children} $msg->children_elements);
-    # Honour message hints
-    return if(grep{$_->element eq '{urn:xmpp:hints}no-copy'} $msg->children_elements);
     # Honour private exclusions and remove it
     if(my @priv=grep {$_->element eq '{'.CBNSv2.'}private'} $msg->children_elements) {
 	$msg->remove_child($priv[0]);
