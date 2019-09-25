@@ -6,6 +6,7 @@ use base 'DJabberd::Plugin';
 
 use constant {
 	CBNSv2 => "urn:xmpp:carbons:2",
+	FWNSv0 => 'urn:xmpp:forward:0'
 };
 
 our $logger = DJabberd::Log->get_logger();
@@ -59,24 +60,17 @@ sub register {
     my $handle_cb = sub {
 	my ($vh,$cb,$sz) = @_;
 	if($sz->isa('DJabberd::Message') && $sz->from && $sz->to) {
+	    # Privacy rules - strip and skip
+	    if((my @priv = grep{$_->element eq '{'.CBNSv2.'}private'}$sz->children_elements)
+		&& grep{$_->element eq '{urn:xmpp:hints}no-copy'}$sz->children_elements) {
+		# Receiving server should strip private element regardless
+		$sz->remove_child($priv[0])
+		    if($sz->connection && $sz->conneciton->vhost->handles_jid($sz->to));
+		return $cb->decline;
+	    }
 	    # Local is selfish and always stops delivery chain. To execute self
 	    # AFTER local we need to cheat it. But first check if we should
-	    my $type = $sz->attr('{}type');
-	    # Skip anything but chat, normal or error (well...)
-	    return $cb->decline
-		unless(!$type
-			or $type eq 'chat'
-			or $type eq 'normal'
-			or $type eq 'error');
-	    # Skip bodyless control messages
-	    return $cb->decline
-		unless(grep {
-			$_->element_name eq 'body' && $_->children
-		       } $sz->children_elements);
-	    # Honour message hints
-	    return $cb->decline
-		if(grep{$_->element eq '{urn:xmpp:hints}no-copy'}
-		    $sz->children_elements);
+	    return $cb->decline if(!eligible($sz));
 	    # Proceed with the cheat otherwise
 	    my $delivered = $cb->{delivered};
 	    $cb->{delivered} = sub {
@@ -106,6 +100,44 @@ sub register {
 
 sub vh {
     return $_[0]->{vhost};
+}
+
+=head2 <Class>::eligible($msg,[160|280|313])
+
+Generlaized call to verify eligibility for carbons. Could also be used for
+MAM (0313) and Offline Delivery (0160).
+
+$msg is a target DJabberd::Message object which eligibility needs to be
+verified.
+
+Second optional argument is eligibility semantic which defaults to XEP-0280.
+Currently supported semantics are 280 (default), 160 and 313.
+=cut
+
+sub eligible {
+    my $sz = shift;
+    my $fv = shift || 280;
+    my $type = $sz->attr('{}type');
+    # Chats are always eligible except for 160, errors sometimes but who cares
+    if ($type eq 'chat' || $type eq 'error') {
+	# 160 does not like chat states
+	return 1 if($fv != 160);
+	# chat SHOULD be stored offline, with the exception of messages that
+	# contain only Chat State Notifications (XEP-0085) [XEP-0160, 3]
+	return 1 if(grep {$_->ns ne 'http://jabber.org/protocol/chatstates'}
+		        $sz->children_elements);
+    } elsif(!$type || $type eq 'normal') {
+	# Normals are with caveats
+	return 1 if($fv == 160);
+	if(grep {
+		($_->element_name eq 'body' && ($_->children || $_->{raw})) ||
+		($_->namespace eq 'urn:xmpp:receipts') ||
+		($_->namespace eq 'http://jabber.org/protocol/chatstates')
+	   } $sz->children_elements) {
+	    return 1;
+	}
+    }
+    return 0;
 }
 
 =head2 $self->manage($iq)
@@ -184,7 +216,7 @@ sub enabled {
     return @ret;
 }
 sub wrap_fwd {
-    return DJabberd::XMLElement->new('urn:xmpp:forward:0','forwarded',{},[@_]);
+    return DJabberd::XMLElement->new(FWNSv0,'forwarded',{xmlns=>FWNSv0},[@_]);
 }
 
 =head2 wrap($msg,$from,$to,$dir)
@@ -198,7 +230,7 @@ sub wrap {
     my ($msg,$from,$to,$dir) = @_;
     my $ret = DJabberd::Message->new('','message',
 	{ '{}from' => $from, '{}to' => $to },
-	[ DJabberd::XMLElement->new(CBNSv2,$dir,{},[ wrap_fwd($msg) ]) ]
+	[ DJabberd::XMLElement->new(CBNSv2,$dir,{xmlns=>CBNSv2},[ wrap_fwd($msg) ]) ]
     );
     $ret->set_attr('{}type',$msg->attr('{}type')) if($msg->attr('{}type'));
     return $ret;
@@ -215,12 +247,6 @@ Eligibility is checked at callback handler in the register method.
 
 sub handle {
     my ($self,$msg) = @_;
-    my $type = $msg->attr('{}type');
-    # Honour private exclusions and remove it
-    if(my @priv=grep {$_->element eq '{'.CBNSv2.'}private'} $msg->children_elements) {
-	$msg->remove_child($priv[0]);
-	return;
-    }
     my $from = $msg->from_jid;
     my $to = $msg->to_jid;
     my @from = $self->enabled($from);

@@ -6,7 +6,7 @@ WriteMakefile(
 	VERSION_FROM => 'lib/DJabberd/Plugin/Carbons.pm',
 	ABSTRACT_FROM => 'lib/DJabberd/Plugin/Carbons.pm',
 	PREREQ_PM => {
-		'DJabberd' => '0.85',
+		'DJabberd' => '0.86',
 	},
 	AUTHOR => 'Ruslan N. Marchenko <me@ruff.mobi>',
 );
