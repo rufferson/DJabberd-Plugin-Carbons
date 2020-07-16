@@ -47,6 +47,10 @@ my %callmap = (
     'set-{'.CBNSv2.'}enable' => \&manage,
     'set-{'.CBNSv2.'}disable' => \&manage,
 );
+my %wraps = (
+    '{'.CBNSv2.'}sent' => 1,
+    '{'.CBNSv2.'}received' => 1,
+);
 sub register {
     my ($self,$vhost) = @_;
     my $manage_cb = sub {
@@ -57,28 +61,36 @@ sub register {
 	}
 	$cb->decline;
     };
-    my $handle_cb = sub {
+    my $recv_cb = sub {
 	my ($vh,$cb,$sz) = @_;
 	if($sz->isa('DJabberd::Message') && $sz->from && $sz->to) {
-	    # Privacy rules - strip and skip
-	    if((my @priv = grep{$_->element eq '{'.CBNSv2.'}private'}$sz->children_elements)
-		&& grep{$_->element eq '{urn:xmpp:hints}no-copy'}$sz->children_elements) {
-		# Receiving server should strip private element regardless
-		$sz->remove_child($priv[0])
-		    if($sz->connection && $sz->conneciton->vhost->handles_jid($sz->to));
-		return $cb->decline;
-	    }
+	    return $cb->decline unless(precheck($sz));
+	    my $to = $sz->to_jid;
+	    # Skip CCing `to` if it is dead, Delivery::Local will do the
+	    # needfull. Also applies to bare jid (which never has connection).
+	    my $c;
+	    return $cb->decline
+		unless(($c = $self->vh->find_jid($to)) && $c->is_available);
 	    # Local is selfish and always stops delivery chain. To execute self
-	    # AFTER local we need to cheat it. But first check if we should
-	    return $cb->decline if(!eligible($sz));
-	    # Proceed with the cheat otherwise
+	    # AFTER local we need to cheat it. But this will depend on whether
+	    # delivery succeeds. If it doesn't - there's nowhere to cc anyway.
 	    my $delivered = $cb->{delivered};
 	    $cb->{delivered} = sub {
-		$self->handle($sz);
+		$self->handle($sz, $to, 'received');
 		$delivered->($cb);
 	    }
 	}
 	$cb->decline;
+    };
+    my $send_cb = sub {
+	my ($vh,$cb,$sz) = @_;
+	if($sz->isa('DJabberd::Message') && $sz->from && $sz->to) {
+	    if(precheck($sz)) {
+		$self->handle($sz, $sz->from_jid, 'sent');
+	    }
+	}
+	# Don't prevent the ball rolling
+	return $cb->decline;
     };
     my $cleanup_cb = sub {
 	my ($vh,$cb,$c) = @_;
@@ -90,8 +102,10 @@ sub register {
     Scalar::Util::weaken($self->{vhost});
     # Inject management IQ handler
     $vhost->register_hook("c2s-iq",$manage_cb);
-    # Deliver hook will handle outgoing and incoming messages.
-    $vhost->register_hook("deliver",$handle_cb);
+    # Deliver hook will handle incoming messages.
+    $vhost->register_hook("deliver",$recv_cb);
+    # And this one is for outgoing
+    $vhost->register_hook("switch_incoming_client",$send_cb);
     # Need to remove dead clients to avoid broadcasting carbons
     $vhost->register_hook("ConnectionClosing",$cleanup_cb);
     $vhost->caps->add(DJabberd::Caps::Feature->new(CBNSv2));
@@ -102,10 +116,27 @@ sub vh {
     return $_[0]->{vhost};
 }
 
-=head2 <Class>::eligible($msg,[160|280|313])
+sub precheck {
+    my ($sz) = @_;
 
-Generlaized call to verify eligibility for carbons. Could also be used for
-MAM (0313) and Offline Delivery (0160).
+    # Privacy rules - strip and skip
+    if((my @priv = grep{$_->element eq '{'.CBNSv2.'}private'}$sz->children_elements)
+	&& grep{$_->element eq '{urn:xmpp:hints}no-copy'}$sz->children_elements)
+    {
+	# Receiving server should strip private element regardless
+	$sz->remove_child($priv[0])
+	    if($sz->connection && $sz->conneciton->vhost->handles_jid($sz->to));
+	return 0;
+    }
+    return 0 if(!eligible($sz));
+    return 1;
+}
+
+# TODO: move it to DJabberd::Message perhaps
+=head2 <Class>::eligible($msg[, 160|280|313])
+
+Generalized call to verify eligibility for Carbons (0280) , MAM (0313) and
+Offline Delivery (0160).
 
 $msg is a target DJabberd::Message object which eligibility needs to be
 verified.
@@ -115,18 +146,13 @@ Currently supported semantics are 280 (default), 160 and 313.
 =cut
 
 sub eligible {
-    my $sz = shift;
-    my $fv = shift || 280;
+    my ($sz, $fv) = @_;
+    $fv ||= 280;
     my $type = $sz->attr('{}type');
+    # Carbon copy is never eligible for anything
+    return 0 if(grep{exists $wraps{$_->element}}$sz->children_elements);
     # Chats are always eligible except for 160, errors sometimes but who cares
-    if ($type eq 'chat' || $type eq 'error') {
-	# 160 does not like chat states
-	return 1 if($fv != 160);
-	# chat SHOULD be stored offline, with the exception of messages that
-	# contain only Chat State Notifications (XEP-0085) [XEP-0160, 3]
-	return 1 if(grep {$_->ns ne 'http://jabber.org/protocol/chatstates'}
-		        $sz->children_elements);
-    } elsif(!$type || $type eq 'normal') {
+    if(!$type || $type eq 'normal') {
 	# Normals are with caveats
 	return 1 if($fv == 160);
 	if(grep {
@@ -136,6 +162,13 @@ sub eligible {
 	   } $sz->children_elements) {
 	    return 1;
 	}
+    } elsif ($type eq 'chat' || $type eq 'error') {
+	# 160 does not like chat states
+	return 1 if($fv != 160);
+	# chat SHOULD be stored offline, with the exception of messages that
+	# contain only Chat State Notifications (XEP-0085) [XEP-0160, 3]
+	return 1 if(grep {$_->ns ne 'http://jabber.org/protocol/chatstates'}
+		        $sz->children_elements);
     }
     return 0;
 }
@@ -151,6 +184,10 @@ sub manage {
     my $self = shift;
     my $iq = shift;
     my $jid = $iq->connection->bound_jid;
+    unless($iq->connection->vhost->uses_jid($iq->to_jid) || !$iq->to || $jid->eq($iq->to_jid)) {
+	$iq->send_error("<error type='cancel'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>");
+	return;
+    }
     delete $iq->attrs->{'{}to'}; # just to ensure
     if($iq->first_element->element_name eq 'disable') {
 	$self->disable($jid);
@@ -211,6 +248,9 @@ enabled, excluding the one represented by the $jid itself.
 
 sub enabled {
     my ($self,$jid) = @_;
+    # Skip bare jids, cannot CC for them as it is handled by Delivery
+    return () if($jid->is_bare);
+    # Skip own jid as well, dups are not permitted even if the client can dedup
     my @ret = grep {$_ && $_ ne $jid->as_string} keys(%{$self->{reg}->{$jid->as_bare_string}})
 	if(exists $self->{reg}->{$jid->as_bare_string} && ref($self->{reg}->{$jid->as_bare_string}));
     return @ret;
@@ -240,36 +280,29 @@ sub wrap {
 
 The method handles message delivery to CC it to enabled resources.
 
-If message is eligible and not private - it is wrapped and delivered to all
-matching C<from> and C<to> local users which enabled the carbons.
-Eligibility is checked at callback handler in the register method.
+The message is wrapped and delivered to all connected resources which enabled
+the carbons. Message eligibility is checked at callback handler in the register
+method. Delivery eligibility is reversed RFC6121 local delivery rule:
+- if `to` is bare - skip as the message will be broadcasted anyway
+- if `to` is full and there's active connection - deliver to all but matching
+- if `to` is full and there's no active connection for it - this should unlock
+conversation delivering it as to bare jid. The current implementation of the
+DJabberd::Delivery::Local does the same as for bare here so skip as well.
+- for `from` - just apply split horizon rule.
 =cut
 
 sub handle {
-    my ($self,$msg) = @_;
-    my $from = $msg->from_jid;
-    my $to = $msg->to_jid;
-    my @from = $self->enabled($from);
-    my @to = $self->enabled($to);
-    $logger->debug("CCing to ".join(', ',(@from,@to))) if(@from or @to);
-    foreach my$jid(@from) {
+    my ($self,$msg,$for,$how) = @_;
+    my @for = $self->enabled($for);
+    $logger->debug("CCing to ".join(', ',(@for))) if(@for);
+    foreach my$jid(@for) {
 	my $conn = $self->vh->find_jid($jid);
 	unless($conn) {
 	    $self->disable(DJabberd::JID->new($jid));
 	    next;
 	}
 	next unless($conn->is_available);
-	my $cc = wrap($msg,$from->as_bare_string,$jid,'sent');
-	$cc->deliver($self->vh);
-    }
-    foreach my$jid(@to) {
-	my $conn = $self->vh->find_jid($jid);
-	unless($conn) {
-	    $self->disable(DJabberd::JID->new($jid));
-	    next;
-	}
-	next unless($conn->is_available);
-	my $cc = wrap($msg,$to->as_bare_string,$jid,'received');
+	my $cc = wrap($msg,$for->as_bare_string,$jid,$how);
 	$cc->deliver($self->vh);
     }
 }
